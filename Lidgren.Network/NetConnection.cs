@@ -36,6 +36,7 @@ namespace Lidgren.Network
 		private object? m_tag;
 		internal readonly NetConnectionStatistics m_statistics;
 		internal readonly Dictionary<int, NetPeer.ReceivedFragmentGroup> m_receivedFragmentGroups = new();
+		internal int m_fragmentReassemblyBytes; // Starlight-edit
 
 		/// <summary>
 		/// Gets or sets the application defined object containing data about the connection
@@ -177,6 +178,9 @@ namespace Lidgren.Network
 					// handle expand mtu
 					MTUExpansionHeartbeat(now);
 				}
+
+				// release stale fragment groups even if the remote stops sending fragments
+				m_peer.ExpireFragmentGroups(this, now);
 
 				if (m_disconnectRequested)
 				{

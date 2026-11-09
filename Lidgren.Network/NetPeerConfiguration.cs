@@ -1,4 +1,4 @@
-﻿/* Copyright (c) 2010 Michael Lidgren
+/* Copyright (c) 2010 Michael Lidgren
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software
 and associated documentation files (the "Software"), to deal in the Software without
@@ -102,6 +102,7 @@ namespace Lidgren.Network
 		internal float m_expandMTUFrequency;
 		internal int m_expandMTUFailAttempts;
 		internal int m_maximumFragmentReassemblyBytesPerConnection;
+		internal long m_maximumFragmentReassemblyBytes; // Starlight-edit
 		internal float m_fragmentGroupTimeout;
 
 		/// <summary>
@@ -155,6 +156,7 @@ namespace Lidgren.Network
 			m_expandMTUFrequency = 2.0f;
 			m_expandMTUFailAttempts = 5;
 			m_maximumFragmentReassemblyBytesPerConnection = 32 * 1024 * 1024;
+			m_maximumFragmentReassemblyBytes = 512L * 1024 * 1024; // Starlight-edit
 			m_fragmentGroupTimeout = 30.0f;
 			m_unreliableSizeBehaviour = NetUnreliableSizeBehaviour.IgnoreMTU;
 
@@ -680,6 +682,22 @@ namespace Lidgren.Network
 				m_maximumFragmentReassemblyBytesPerConnection = value;
 			}
 		}
+
+		#region Starlight
+		/// <summary>
+		/// Gets or sets the maximum bytes used by incomplete fragment groups across all connections of this peer.
+		/// </summary>
+		public long MaximumFragmentReassemblyBytes
+		{
+			get { return m_maximumFragmentReassemblyBytes; }
+			set
+			{
+				if (value < 1)
+					throw new NetException("MaximumFragmentReassemblyBytes must be at least 1");
+				m_maximumFragmentReassemblyBytes = value;
+			}
+		}
+		#endregion
 
 		/// <summary>
 		/// Gets or sets how long an incomplete fragment group is kept alive, in seconds.

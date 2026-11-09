@@ -8,6 +8,12 @@ namespace Lidgren.Network
 	{
 		private int m_lastUsedFragmentGroup;
 
+		// Starlight-start: bytes held by incomplete fragment groups across all connections, network thread only
+		private long m_fragmentReassemblyBytes;
+		// rough per chunk bookkeeping cost (dictionary entry + tuple) so tiny chunks are not free
+		private const int c_fragmentChunkOverheadBytes = 64;
+		// Starlight-end
+
 		// on user thread
 		private NetSendResult SendFragmentedMessage(NetOutgoingMessage msg, IList<NetConnection> recipients, NetDeliveryMethod method, int sequenceChannel)
 		{
@@ -119,9 +125,16 @@ namespace Lidgren.Network
 
 			NetException.Assert(chunkNumber < totalNumChunks);
 
+			// Every chunk but the last must be exactly chunkByteSize and the last must
+			// be exactly the remainder. Otherwise tiny chunks could "complete" a large
+			// group with little traffic, exposing stale pooled buffer contents.
+			int expectedPayload = chunkNumber == totalNumChunks - 1
+				? totalBytes - (totalNumChunks - 1) * chunkByteSize
+				: chunkByteSize;
+
 			if (chunkNumber < 0
 				|| chunkNumber >= totalNumChunks
-				|| (long)chunkNumber * chunkByteSize + payloadLength > totalBytes)
+				|| payloadLength != expectedPayload)
 			{
 				LogRateLimitedWarning(NetLogRateLimitTarget.MalformedFragment, im.SenderEndPoint, $"Dropping out-of-range fragment {chunkNumber}/{totalNumChunks} from {im.SenderEndPoint}");
 				Recycle(im);
@@ -130,9 +143,25 @@ namespace Lidgren.Network
 
 			NetException.Assert(im.SenderConnection != null);
 
-			var groups = im.SenderConnection.m_receivedFragmentGroups;
+			// Starlight-start
+			var connection = im.SenderConnection;
+			var groups = connection.m_receivedFragmentGroups;
+			// Starlight-end
 			double now = NetTime.Now;
-			ExpireFragmentGroups(groups, now);
+			ExpireFragmentGroups(connection, now); // Starlight-edit
+
+			// Starlight start: memory is accounted per received chunk, not per claimed group size,
+			// so holding reassembly memory requires actually sending that much data
+			int chunkCost = GetStorageBucketSize(payloadLength) + c_fragmentChunkOverheadBytes;
+			if (connection.m_fragmentReassemblyBytes + chunkCost > m_configuration.m_maximumFragmentReassemblyBytesPerConnection
+				|| m_fragmentReassemblyBytes + chunkCost > m_configuration.m_maximumFragmentReassemblyBytes)
+			{
+				LogRateLimitedWarning(NetLogRateLimitTarget.MalformedFragment, im.SenderEndPoint, $"Too much fragment reassembly data from {im.SenderEndPoint}; dropping fragment");
+				Recycle(im);
+				return;
+			}
+			// Starlight end
+
 			if (!groups.TryGetValue(group, out var info))
 			{
 				// single fragment groups can't accumulate unbounded buffers
@@ -143,16 +172,17 @@ namespace Lidgren.Network
 					return;
 				}
 
-				if (GetTotalFragmentGroupBytes(groups) + totalBytes > m_configuration.m_maximumFragmentReassemblyBytesPerConnection)
+				// Starlight-start: a group that can never fit in the budget can never complete
+				if (totalBytes > m_configuration.m_maximumFragmentReassemblyBytesPerConnection
+					|| totalBytes > m_configuration.m_maximumFragmentReassemblyBytes)
 				{
-					LogRateLimitedWarning(NetLogRateLimitTarget.MalformedFragment, im.SenderEndPoint, $"Too much fragment reassembly data from {im.SenderEndPoint}; dropping fragment");
+					LogRateLimitedWarning(NetLogRateLimitTarget.MalformedFragment, im.SenderEndPoint, $"Fragment group of {totalBytes} bytes from {im.SenderEndPoint} exceeds reassembly limit; dropping fragment");
 					Recycle(im);
 					return;
 				}
+				// Starlight-end
 
 				info = new ReceivedFragmentGroup(
-					GetStorage(totalBytes),
-					new NetBitVector(totalNumChunks),
 					totalBytes,
 					totalBits,
 					chunkByteSize,
@@ -160,7 +190,7 @@ namespace Lidgren.Network
 					now);
 				groups[group] = info;
 			}
-			// The computed offset/copy and received chunk bit vector depend on this
+			// The computed offset/copy and received chunk set depend on this
 			// header data matching the first fragment for the group.
 			else if (info.TotalBytes != totalBytes
 				|| info.TotalBits != totalBits
@@ -172,7 +202,7 @@ namespace Lidgren.Network
 				return;
 			}
 
-			if (!info.MarkChunkReceived(chunkNumber))
+			if (info.HasChunk(chunkNumber)) // Starlight-edit
 			{
 				Recycle(im);
 				return;
@@ -180,26 +210,38 @@ namespace Lidgren.Network
 
 			info.LastReceived = now;
 
-			// copy to data
-			int offset = (chunkNumber * chunkByteSize);
-			Buffer.BlockCopy(im.Data, ptr, info.Data, offset, payloadLength);
+			// Starlight-start
+			// copy chunk payload out; im is recycled or reused below
+			byte[] chunkData = GetStorage(payloadLength);
+			Buffer.BlockCopy(im.Data, ptr, chunkData, 0, payloadLength);
+			info.AddChunk(chunkNumber, chunkData, payloadLength, chunkCost);
+			connection.m_fragmentReassemblyBytes += chunkCost;
+			m_fragmentReassemblyBytes += chunkCost;
+			// Starlight-end
 
 			int cnt = info.ReceivedChunkCount;
-			//LogVerbose($"Found fragment #{chunkNumber} in group {group} offset {offset} of total bits {totalBits} (total chunks done {cnt})");
 
 			LogVerbose($"Received fragment {chunkNumber} of {totalNumChunks} ({cnt} chunks received)");
 
 			if (cnt == totalNumChunks)
 			{
-				// Done! Transform this incoming message
-				im.m_data = info.Data;
-				im.m_bitLength = totalBits;
-				im.m_isFragment = false;
+				// Starlight-start
+				// Done! Assemble the chunks and transform this incoming message
+				byte[] data = GetStorage(totalBytes);
+				foreach (var pair in info.Chunks)
+					Buffer.BlockCopy(pair.Value.Data, 0, data, pair.Key * chunkByteSize, pair.Value.Length);
 
 				LogVerbose($"Fragment group #{group} fully received in {totalNumChunks} chunks ({totalBits} bits)");
 				groups.Remove(group);
+				ReleaseFragmentGroup(connection, info);
+
+				Recycle(im.m_data!);
+				im.m_data = data;
+				im.m_bitLength = totalBits;
+				im.m_isFragment = false;
 
 				ReleaseMessage(im);
+				// Starlight-end
 			}
 			else
 			{
@@ -210,8 +252,9 @@ namespace Lidgren.Network
 			return;
 		}
 
-		private void ExpireFragmentGroups(Dictionary<int, ReceivedFragmentGroup> groups, double now)
+		internal void ExpireFragmentGroups(NetConnection connection, double now)
 		{
+			var groups = connection.m_receivedFragmentGroups; // Starlight-edit
 			if (groups.Count == 0)
 				return;
 
@@ -221,17 +264,28 @@ namespace Lidgren.Network
 				if (pair.Value.LastReceived >= oldestAllowed)
 					continue;
 
-				Recycle(pair.Value.Data);
 				groups.Remove(pair.Key);
+				ReleaseFragmentGroup(connection, pair.Value);
 			}
 		}
 
-		private static int GetTotalFragmentGroupBytes(Dictionary<int, ReceivedFragmentGroup> groups)
+		#region Starlight
+		internal void ClearFragmentGroups(NetConnection connection)
 		{
-			int total = 0;
-			foreach (var group in groups.Values)
-				total += group.TotalBytes;
-			return total;
+			foreach (var group in connection.m_receivedFragmentGroups.Values)
+				ReleaseFragmentGroup(connection, group);
+			connection.m_receivedFragmentGroups.Clear();
 		}
+
+		private void ReleaseFragmentGroup(NetConnection connection, ReceivedFragmentGroup group)
+		{
+			foreach (var chunk in group.Chunks.Values)
+				Recycle(chunk.Data);
+			group.Chunks.Clear();
+
+			connection.m_fragmentReassemblyBytes -= group.StoredBytes;
+			m_fragmentReassemblyBytes -= group.StoredBytes;
+		}
+		#endregion
 	}
 }

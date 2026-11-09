@@ -131,11 +131,7 @@ namespace Lidgren.Network
 				m_peer.m_handshakes.Remove(m_remoteEndPoint);
 
 			// free all the buffers that are no longer needed
-			foreach (var group in m_receivedFragmentGroups.Values)
-			{
-				m_peer.Recycle(group.Data);
-			}
-			m_receivedFragmentGroups.Clear();
+			m_peer.ClearFragmentGroups(this); // Starlight-edit
 
 			// decrement concurrent connections count (but not rapid connection times, it will decay)
 			m_peer.DecrementConnectionCount(m_remoteEndPoint);
